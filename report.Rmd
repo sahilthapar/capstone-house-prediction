@@ -1,0 +1,227 @@
+---
+title: "Capstone"
+author: "Sahil Thapar"
+date: "5/22/2017"
+output: 
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = F, message = F, cache = T)
+```
+
+## The plan
+
+1. Data cleaning
+    + Identify missing values and outliers and handle them
+2. Exploratory Data Analysis
+    + Univariate analysis
+        * Analyze the dependent variable, `SalesPrice`
+    + Multivariate analysis
+        * Analyze relationship between dependent and independent variables
+            * numeric variables - correlation
+            * categorical variables - distributrion across categories
+3. Identify relatively important features based on a combination of instinct and numerical analysis.
+
+
+## Data cleaning
+
+```{r}
+# packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(tidyverse)
+library(readr)
+library(forcats)
+library(purrr)
+library(tibble)
+library(corrplot)
+library(scales)
+
+
+# Read data
+train <- read_csv('data/train.csv')
+
+# Count missing values
+missing.count <- colSums(sapply(train, is.na))
+missing.count <- missing.count[missing.count > 0]
+missing.count <- as_tibble(data.frame(column = names(missing.count),
+                           count = missing.count,
+                           row.names = NULL))
+
+missing.count <-
+  missing.count %>%
+  mutate(percent_missing = round(count / nrow(missing.count))) %>%
+  arrange(desc(count))
+  
+missing.count
+```
+
+* __PoolQC, MiscFeature, Alley, Fence, FireplaceQu__:  
+    + All categorical variables where NA represents absence of the feature and not missing data.
+* __Garage Variables__
+    + Data is missing when no garage is present 
+    * __GarageType, GarageFinish, GarageQual, GarageCond__
+        * NA can be taken as a different category
+    * __GarageYrBit__
+        * We can remove this variable
+* __Basement Variables__
+    + Missing data represents no basement
+    * __BsmtExposure, BsmtFinType1, BsmtFinType1, BsmtQual, BsmtCond__
+        * NA can be taken as a different category
+* __MasVnrType__
+    + Masonry veneer type, NA represents no veneer
+* __MasVnrArea__
+    + Masonry veneer area, NA represents no veneer we can substitute with 0.
+* __Electrical__
+    + 1 missing observation. We can delete this observation
+* __LotFrontage__
+    + Can't set this to zero as it doesn't make sense that a house has no distance between the street
+    
+```{r}
+create_none <- function(colName) {
+  train[colName] <<- ifelse(is.na(train[colName]),
+                           "None",
+                           train[colName])
+} 
+
+# Remove id, garage year built, set masvnrarea to zero where null and remove observation with electrical as NA
+train <- 
+  train %>%
+  select(-c(GarageYrBlt, Id)) %>%
+  mutate(MasVnrArea = ifelse(is.na(MasVnrArea),
+                                   0,
+                                   MasVnrArea)) %>%
+  filter(!is.na(Electrical)) 
+```
+
+To handle LotFrontage, it seems instinctive that it will be related to LotArea
+
+```{r}
+train %>%
+  select(c(LotArea, LotFrontage)) %>%
+  na.omit %>%
+  cor
+
+train %>%
+  select(c(LotArea, LotFrontage)) %>%
+  na.omit %>%
+  mutate(LotArea = sqrt(LotArea)) %>%
+  cor
+```
+
+We will substitue missing LotFrontage value with the square root of the lotarea
+
+```{r}
+train <-
+  train %>%
+  mutate(LotFrontage = ifelse(is.na(LotFrontage),
+                              sqrt(LotArea),
+                              LotFrontage))
+
+train[is.na(train)] <- "None"
+```
+
+## Exploring the data
+
+### Univariate analysis
+
+```{r}
+summary(train$SalePrice)
+```
+
+
+```{r}
+  ggplot(data = train) +
+  geom_histogram(mapping = aes(SalePrice),
+                 fill = "#3498db",
+                 color = "#2980b9",
+                 binwidth = 10000) +
+  scale_x_continuous(labels = comma_format()) +
+  geom_vline(mapping = aes(xintercept = mean(train$SalePrice)),
+                           colour = '#e74c3c',
+                           size = 0.5) +
+  geom_vline(mapping = aes(xintercept = median(train$SalePrice)),
+                           colour = '#f39c12',
+                           size = 0.5) +
+  labs(x = "Sale Price",
+       y = "Count")
+
+  ggplot(data = train) +
+  geom_histogram(mapping = aes(log(SalePrice)),
+                 fill = "#3498db",
+                 color = "#2980b9") +
+  scale_x_continuous(labels = comma_format()) +
+  geom_vline(mapping = aes(xintercept = log(mean(train$SalePrice))),
+                           colour = '#e74c3c',
+                           size = 0.5) +
+  geom_vline(mapping = aes(xintercept = log(median(train$SalePrice))),
+                           colour = '#f39c12',
+                           size = 0.5) +
+  labs(x = "Log Sale Price",
+       y = "Count")
+```
+
+### Relationship with other numeric variables
+
+```{r, fig.height = 12, fig.width = 10}
+nums <- sapply(train, is.numeric)
+M <- cor(train[, nums])
+corrplot(M, method = "circle", type = "upper", order = "hclust")
+```
+
+For variable selection we can choose only the variables which have at least a correlation of 0.5 with SalesPrice
+
+```{r}
+M.tbl <- as_tibble(data.frame(variable = rownames(M),
+                              correlation = M[, 36]))
+var.cor <- 
+  M.tbl %>%
+  filter((abs(correlation) > 0.5) & (abs(correlation) < 1)) %>%
+  arrange(desc(correlation))
+
+ggplot(data = var.cor) +
+  geom_bar(mapping = aes(x = reorder(variable, correlation),
+                         y = correlation),
+           stat = "identity",
+           fill = "#27ae60",
+           color = "#16a085",
+           width = 0.5) +
+  labs(x = "Variable",
+       y = "Correlation") +
+  coord_flip()
+```
+
+## Linear model
+
+```{r}
+lm.model <- lm(SalePrice ~ ., 
+               data = train)
+lm.model.summary <- summary(lm.model)
+lm.model.summary
+
+c <- coef(lm.model.summary)
+c <- 
+  as_tibble(data.frame(var = rownames(c), c, row.names = NULL)) %>%
+  filter(Pr...t.. < 0.01) %>%
+  arrange(Pr...t..)
+c
+```
+
+## Next up
+
+* Stepwise regression
+* Lasso regressin
+* PCA
+* More EDA on categorical and numerical variables
+* Random Forest
+* XgBoost
+
+1. Note: Ensure that the sign of the slope parameter is correct
+
+2. Table with sign p-value for every column selected
+Check for collinearity because of sign
+
+3. Evaluation metrics - RMSE, 
