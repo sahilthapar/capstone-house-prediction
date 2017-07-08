@@ -28,21 +28,20 @@ knitr::opts_chunk$set(warning = F, message = F, cache = T)
 ## Data cleaning
 
 ```{r}
-# packages
-library(dplyr)
-library(tidyr)
 library(ggplot2)
-library(tidyverse)
+library(plyr)
+library(dplyr)
+library(caret)
+library(moments)
+library(glmnet)
+library(elasticnet)
+library(knitr)
 library(readr)
-library(forcats)
-library(purrr)
-library(tibble)
-library(corrplot)
-library(scales)
 
 
 # Read data
-train <- read_csv('data/train.csv')
+train <- read.csv('data/train.csv', stringsAsFactors = T)
+test <- read.csv('data/test.csv', stringsAsFactors = T)
 
 # Count missing values
 missing.count <- colSums(sapply(train, is.na))
@@ -53,7 +52,7 @@ missing.count <- as_tibble(data.frame(column = names(missing.count),
 
 missing.count <-
   missing.count %>%
-  mutate(percent_missing = round(count / nrow(missing.count))) %>%
+  mutate(percent_missing = round(100 * (count / nrow(train)),2)) %>%
   arrange(desc(count))
   
 missing.count
@@ -79,50 +78,10 @@ missing.count
     + 1 missing observation. We can delete this observation
 * __LotFrontage__
     + Can't set this to zero as it doesn't make sense that a house has no distance between the street
-    
-```{r}
-create_none <- function(colName) {
-  train[colName] <<- ifelse(is.na(train[colName]),
-                           "None",
-                           train[colName])
-} 
-
-# Remove id, garage year built, set masvnrarea to zero where null and remove observation with electrical as NA
-train <- 
-  train %>%
-  select(-c(GarageYrBlt, Id)) %>%
-  mutate(MasVnrArea = ifelse(is.na(MasVnrArea),
-                                   0,
-                                   MasVnrArea)) %>%
-  filter(!is.na(Electrical)) 
-```
 
 To handle LotFrontage, it seems instinctive that it will be related to LotArea
 
-```{r}
-train %>%
-  select(c(LotArea, LotFrontage)) %>%
-  na.omit %>%
-  cor
-
-train %>%
-  select(c(LotArea, LotFrontage)) %>%
-  na.omit %>%
-  mutate(LotArea = sqrt(LotArea)) %>%
-  cor
-```
-
 We will substitue missing LotFrontage value with the square root of the lotarea
-
-```{r}
-train <-
-  train %>%
-  mutate(LotFrontage = ifelse(is.na(LotFrontage),
-                              sqrt(LotArea),
-                              LotFrontage))
-
-train[is.na(train)] <- "None"
-```
 
 ## Exploring the data
 
@@ -167,9 +126,22 @@ summary(train$SalePrice)
 ### Relationship with other numeric variables
 
 ```{r, fig.height = 12, fig.width = 10}
-nums <- sapply(train, is.numeric)
-M <- cor(train[, nums])
-corrplot(M, method = "circle", type = "upper", order = "hclust")
+for.cor <- 
+  train %>%
+  dplyr::select(-c(GarageYrBlt, Id)) %>%
+  mutate(MasVnrArea = ifelse(is.na(MasVnrArea),
+                                   0,
+                                   MasVnrArea)) %>%
+  filter(!is.na(Electrical)) %>%
+  mutate(LotFrontage = ifelse(is.na(LotFrontage),
+                              sqrt(LotArea),
+                              LotFrontage))
+
+for.cor[is.na(for.cor)] <- "None"
+
+nums <- sapply(for.cor, is.numeric)
+M <- cor(for.cor[, nums])
+corrplot(M, method = "circle", type = "upper")
 ```
 
 For variable selection we can choose only the variables which have at least a correlation of 0.5 with SalesPrice
@@ -194,26 +166,167 @@ ggplot(data = var.cor) +
   coord_flip()
 ```
 
-## Linear model
+# Modelling
+
+# Evaluation
+```{r}
+rmse <- function(predicted, actual) {
+  return(sqrt(mean((predicted - actual)^2)))
+}
+mse <- function(predicted, actual) {
+  return(mean((predicted - actual)^2))
+}
+mae <- function(predicted, actual) {
+  return(mean(abs(predicted - actual)))
+}
+mape <- function(predicted, actual) {
+  return(mean(abs(predicted - actual)/actual))
+}
+```
 
 ```{r}
-lm.model <- lm(SalePrice ~ ., 
-               data = train)
-lm.model.summary <- summary(lm.model)
-lm.model.summary
+all_data <- rbind(train[, 1:ncol(train)-1],
+                  test[, 1:ncol(test)])
 
-c <- coef(lm.model.summary)
-c <- 
-  as_tibble(data.frame(var = rownames(c), c, row.names = NULL)) %>%
-  filter(Pr...t.. < 0.01) %>%
-  arrange(Pr...t..)
-c
+df <- rbind(data.frame(version="log_price",
+                       x=log(train$SalePrice + 1)),
+            data.frame(version="price",
+                       x=train$SalePrice))
+# transform SalePrice target to log form
+train$SalePrice <- log(train$SalePrice + 1)
+
+# for numeric feature with excessive skewness, perform log transformation
+# first get data type for each feature
+feature_classes <- sapply(names(all_data),function(x){class(all_data[[x]])})
+numeric_feats <-names(feature_classes[feature_classes != "factor"])
+
+# determine skew for each numeric feature
+skewed_feats <- sapply(numeric_feats[2],function(x){skewness(all_data[[x]],na.rm=TRUE)})
+
+# keep only features that exceed a threshold for skewness
+skewed_feats <- skewed_feats[skewed_feats > 0.75]
+
+# transform excessively skewed features with log(x + 1)
+for(x in names(skewed_feats)) {
+  all_data[[x]] <- log(all_data[[x]] + 1)
+}
+
+
+# get names of categorical features
+categorical_feats <- names(feature_classes[feature_classes == "factor"])
+
+# use caret dummyVars function for hot one encoding for categorical features
+dummies <- dummyVars(~.,all_data[categorical_feats])
+categorical_1_hot <- predict(dummies,all_data[categorical_feats])
+categorical_1_hot[is.na(categorical_1_hot)] <- 0  #for any level that was NA, set to zero
+
+numeric_df <- all_data[numeric_feats]
+
+for (x in numeric_feats) {
+  mean_value <- mean(train[[x]],na.rm = TRUE)
+  all_data[[x]][is.na(all_data[[x]])] <- mean_value
+}
+
+all_data <- cbind(all_data[numeric_feats],categorical_1_hot)
+
+# create data for training and test
+X_train <- all_data[1:nrow(train),]
+X_test <- all_data[(nrow(train)+1):nrow(all_data),]
+y <- train$SalePrice
 ```
+
+## Linear Model
+
+```{r}
+abc <- cbind(X_train, SalePrice = y)
+
+lm.model <- lm(SalePrice ~ .,
+               data = as.data.frame(abc))
+# RMSE
+in.sample.pred <- predict(lm.model)
+rmse(in.sample.pred, y)
+out.sample.pred <- predict(lm.model,
+                           data = X_test)
+write_csv(x = as.data.frame(out.sample.pred),
+          path = 'data/linear_model.csv')
+
+```
+
+## Lasso Regression
+
+```{r}
+CARET.TRAIN.CTRL <- trainControl(method="repeatedcv",
+                                 number=5,
+                                 repeats=5,
+                                 verboseIter=FALSE)
+lambdas <- seq(1,0,-0.001)
+
+# train model
+set.seed(123)  # for reproducibility
+model_ridge <- train(x=X_train,y=y,
+                     method="glmnet",
+                     metric="RMSE",
+                     maximize=FALSE,
+                     trControl=CARET.TRAIN.CTRL,
+                     tuneGrid=expand.grid(alpha=0, # Ridge regression
+                                          lambda=lambdas))
+
+ggplot(data=filter(model_ridge$result,RMSE<0.14)) +
+  geom_line(aes(x=lambda,y=RMSE))
+
+mean(model_ridge$resample$RMSE)
+
+set.seed(123)  # for reproducibility
+model_lasso <- train(x=X_train,y=y,
+                     method="glmnet",
+                     metric="RMSE",
+                     maximize=FALSE,
+                     trControl=CARET.TRAIN.CTRL,
+                     tuneGrid=expand.grid(alpha=1,  # Lasso regression
+                                          lambda=c(1,0.1,0.05,0.01,seq(0.009,0.001,-0.001),
+                                                   0.00075,0.0005,0.0001)))
+model_lasso
+
+coef <- data.frame(coef.name = dimnames(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda))[[1]], 
+                   coef.value = matrix(coef(model_lasso$finalModel,s=model_lasso$bestTune$lambda)))
+
+# exclude the (Intercept) term
+coef <- coef[-1,]
+picked_features <- nrow(filter(coef,coef.value!=0))
+not_picked_features <- nrow(filter(coef,coef.value==0))
+
+cat("Lasso picked",picked_features,"variables and eliminated the other",
+    not_picked_features,"variables\n")
+# sort coefficients in ascending order
+coef <- arrange(coef,-coef.value)
+
+# extract the top 10 and bottom 10 features
+imp_coef <- rbind(head(coef,10),
+                  tail(coef,10))
+
+ggplot(imp_coef) +
+  geom_bar(aes(x=reorder(coef.name,coef.value),y=coef.value),
+           stat="identity") +
+  ylim(-1.5,0.6) +
+  coord_flip() +
+  ggtitle("Coefficents in the Lasso Model") +
+  theme(axis.title=element_blank())
+
+preds <- exp(predict(model_lasso,newdata=X_test)) - 1
+# construct data frame for solution
+solution <- data.frame(Id=as.integer(rownames(X_test)),SalePrice=preds)
+write.csv(solution,"data/regularized_linear_model.csv",row.names=FALSE)
+rmse(predict(model_lasso), y)
+```
+
+```{r}
+
+```
+
+
 
 ## Next up
 
-* Stepwise regression
-* Lasso regressin
 * PCA
 * More EDA on categorical and numerical variables
 * Random Forest
